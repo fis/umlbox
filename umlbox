@@ -289,13 +289,17 @@ runas = "user"
 if superuser:
     runas = "root"
 confs += "run " + runas + " " + cwd + " " + " ".join(cmd) + ttycat + "\n"
+if verbose:
+    print("Configuration:\n" + confs + "\n")
+
+# Pad to block boundary, to avoid ubd from wrapping around
+if len(confs) % 512 != 0:
+    confs += "\0" * (512 - len(confs) % 512)
 
 # Write out the configuration
 conff = open(conf, "w")
 conff.write(confs)
 conff.close()
-if verbose:
-    print("Configuration:\n" + confs + "\n")
 
 # open all our new pipes
 childStdout = os.dup(1) # To keep output
