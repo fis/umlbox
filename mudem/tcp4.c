@@ -15,6 +15,7 @@
  */
 
 #define _POSIX_SOURCE /* for strtok_r */
+#define _POSIX_C_SOURCE 201112L /* for getaddrinfo */
 
 #include <netdb.h>
 #include <string.h>
