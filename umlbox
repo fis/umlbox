@@ -45,6 +45,9 @@ mudem = False
 # child's cwd
 cwd = os.getcwd()
 
+# child's extra environment
+env = {}
+
 # where to get stdin from
 childStdin = "fd:0"
 
@@ -77,6 +80,7 @@ def usage():
           "\t--cwd <dir>: Set cwd in guest to <dir>.\n" +
           "\t--no-cwd: Set cwd in guest to /.\n" +
           "\t--copy-cwd: Copy the host cwd (the default).\n" +
+          "\t--env var=value: Set <var> to <value> in the environment of the guest.\n" +
           "\t-L<hport>:<gport>: Forward local port hport into the UMLBox on\n" +
           "\t                   port gport.\n" +
           "\t-R<gport>:<host>:<hport>: Forward port gport out of the UMLBox to\n" +
@@ -138,6 +142,14 @@ while i < len(sys.argv):
 
     elif arg == "--copy-cwd":
         cwd = os.getcwd()
+
+    elif arg == "--env":
+        i += 1
+        parts = sys.argv[i].replace("\n", r"\n").replace("\0", r"\0").split("=", 1)
+        if len(parts) != 2:
+            usage()
+            sys.exit(1)
+        env[parts[0].replace(" ", "_")] = parts[1]
 
     elif arg[0:2] == "-L":
         parts = arg[2:].split(":")
@@ -283,6 +295,10 @@ confs += ("timeout " + str(timeout) + "\n" +
           "output ../tty1\n")
 if not istty:
     confs += "ttyraw\n"
+
+# Extra environment variables
+for k, v in env.items():
+    confs += "env " + k + " " + v + "\n"
 
 # And finally, the command
 runas = "user"
