@@ -16,265 +16,286 @@
 import argparse
 import collections
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
 
-parser = argparse.ArgumentParser(description='Run a command in a UML sandbox.')
-parser.add_argument(
-    '--verbose', '-v', action='store_true',
-    help='verbose mode')
-parser.add_argument(
-    '--debug', action='store_true',
-    help='keep UML kernel and init output visible')
-group = parser.add_argument_group('mount options')
-group.add_argument(
-    '--base-mounts', action='store_true',
-    help='use base set of mount points')
-group.add_argument(
-    '--mount', metavar='DIR', action='append', default=[],
-    help='share a directory, read-only')
-group.add_argument(
-    '--mount-write', metavar='DIR', action='append', default=[],
-    help='share a directory, read-write')
-group.add_argument(
-    '--translate', nargs=2, metavar=('GUEST', 'HOST'), action='append', default=[],
-    help='share a directory with a different name, read-only')
-group.add_argument(
-    '--translate-write', nargs=2, metavar=('GUEST', 'HOST'), action='append', default=[],
-    help='share a directory with a different name, read-write')
-group = parser.add_argument_group('execution options')
-group.add_argument(
-    '--cwd', metavar='DIR',
-    help='set cwd in guest to DIR')
-group.add_argument(
-    '--env', metavar='VAR=VALUE', action='append', default=[],
-    help='set VAR to VALUE in the guest environment')
-group.add_argument(
-    '--no-stdin', action='store_true',
-    help='detach from stdin')
-group.add_argument(
-    '--root', action='store_true',
-    help='run as root within UML (negates security benefits)')
-group = parser.add_argument_group('communication options')
-group.add_argument(
-    '--local', metavar='H:G', action='append', default=[],
-    help='forward local TCP port H on host to port G on guest')
-group.add_argument(
-    '--remote', metavar='G:A:P', action='append', default=[],
-    help='forward remote TCP port G on guest to address A:P')
-group.add_argument(
-    '--x11', action='store_true',
-    help='enable X11 forwarding')
-group = parser.add_argument_group('execution limits')
-group.add_argument(
-    '--timeout', metavar='T', type=int, default=0,
-    help='set a timeout of T seconds')
-group.add_argument(
-    '--memory', metavar='M', default='256M',
-    help='set a memory limit of M (default 256M)')
-group = parser.add_argument_group('binaries')
-group.add_argument(
-    '--linux', metavar='KERNEL',
-    help='use the given UML kernel binary')
-group.add_argument(
-    '--mudem', metavar='MUDEM',
-    help='use the given mudem binary for port forwarding')
+# parse command-line arguments
 
-parser.add_argument(
-    'cmd', metavar='X', nargs='+',
-    help='command and optional arguments to execute')
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run a command in a UML sandbox.')
 
-args = parser.parse_args()
+    parser.add_argument(
+        '--verbose', '-v', action='store_true',
+        help='verbose mode')
+    parser.add_argument(
+        '--debug', action='store_true',
+        help='keep UML kernel and init output visible')
 
-# globals
-bindir = os.path.abspath(os.path.dirname(sys.argv[0]))
-pid = str(os.getpid())
-uid = str(os.getuid())
-gid = str(os.getgid())
-istty = False
-if os.isatty(1):
-    istty = True
-conf = "/tmp/" + pid + ".conf"
+    group = parser.add_argument_group('mount options')
+    group.add_argument(
+        '--base-mounts', action='store_true',
+        help='use base set of mount points')
+    group.add_argument(
+        '--mount', metavar='DIR', action='append', default=[],
+        help='share a directory, read-only')
+    group.add_argument(
+        '--mount-write', metavar='DIR', action='append', default=[],
+        help='share a directory, read-write')
+    group.add_argument(
+        '--translate', nargs=2, metavar=('GUEST', 'HOST'), action='append', default=[],
+        help='share a directory with a different name, read-only')
+    group.add_argument(
+        '--translate-write', nargs=2, metavar=('GUEST', 'HOST'), action='append', default=[],
+        help='share a directory with a different name, read-write')
 
-# the command to run
-cmd = ["'" + arg.replace("'", "'\\\''").replace("\n", "'\\n'") + "'"
-       for arg in args.cmd]
+    group = parser.add_argument_group('execution options')
+    group.add_argument(
+        '--cwd', metavar='DIR',
+        help='set cwd in guest to DIR')
+    group.add_argument(
+        '--env', metavar='VAR=VALUE', action='append', default=[],
+        help='set VAR to VALUE in the guest environment')
+    group.add_argument(
+        '--no-stdin', action='store_true',
+        help='detach from stdin')
+    group.add_argument(
+        '--root', action='store_true',
+        help='run as root within UML (negates security benefits)')
 
-# the mount points
-Mount = collections.namedtuple('Mount', 'rrw host guest')
-mounts = {}
-if args.base_mounts:
-    for m in ('/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/etc/alternatives', '/dev'):
-        if os.path.isdir(m):
-            mounts[m] = Mount(rrw='r', host=m, guest=m)
-for rrw, specs in (('r', args.mount), ('rw', args.mount_write)):
-    for spec in specs:
-        mdir = os.path.abspath(spec)
-        mounts[mdir] = Mount(rrw=rrw, host=mdir, guest=mdir)
-for rrw, specs in (('r', args.translate), ('rw', args.translate_write)):
-    for guest, host in specs:
-        mdir = os.path.abspath(host)
-        mounts[guest] = Mount(rrw=rrw, host=mdir, guest=guest)
+    group = parser.add_argument_group('communication options')
+    group.add_argument(
+        '--local', metavar='H:G', action='append', default=[],
+        help='forward local TCP port H on host to port G on guest')
+    group.add_argument(
+        '--remote', metavar='G:A:P', action='append', default=[],
+        help='forward remote TCP port G on guest to address A:P')
+    group.add_argument(
+        '--x11', action='store_true',
+        help='enable X11 forwarding')
 
-# kernel
-linux = args.linux
-if linux is None:
-    linux = os.path.join(bindir, 'umlbox-linux')
-    if not os.path.exists(linux):
-        linux = os.path.join(bindir, 'linux')
-    if not os.path.exists(linux):
-        linux = '/usr/bin/linux'
-    if not os.path.exists(linux):
-        print("Could not find a UML kernel.")
-        sys.exit(1)
-if args.verbose:
-    print("Found UML kernel " + linux)
+    group = parser.add_argument_group('execution limits')
+    group.add_argument(
+        '--timeout', metavar='T', type=int, default=0,
+        help='set a timeout of T seconds')
+    group.add_argument(
+        '--memory', metavar='M', default='256M',
+        help='set a memory limit of M (default 256M)')
 
-# mudem
-mudem = args.mudem
-if mudem is None:
-    mudem = os.path.join(bindir, 'umlbox-mudem')
-mudemHost = [mudem, '0']
-mudemGuest = [mudem, '1']
-for spec in args.local:
-    parts = spec.split(":")
-    if len(parts) != 2:
-        parser.error('expected --local H:G, got --local "{}"'.format(spec))
-    mudemHost.append('tcp4-listen:{}'.format(parts[0]))
-    mudemGuest.append('tcp4:127.0.0.1:{}'.format(parts[1]))
-for spec in args.remote:
-    parts = spec.split(":")
-    if len(parts) != 3:
-        parser.error('expected --remote G:A:P, got --remote "{}"'.format(spec))
-    mudemHost.append('tcp4:{}:{}'.format(parts[1], parts[2]))
-    mudemGuest.append('tcp4-listen:{}'.format(parts[0]))
-if args.x11:
-    mudemHost.append('unix:/tmp/.X11-unix/X0')
-    mudemGuest.append('tcp4-listen:6000')
+    group = parser.add_argument_group('paths')
+    group.add_argument(
+        '--linux', metavar='KERNEL',
+        help='use the given UML kernel binary')
+    group.add_argument(
+        '--mudem', metavar='MUDEM',
+        help='use the given mudem binary for port forwarding')
+    group.add_argument(
+        '--initrd', metavar='INITRD',
+        help='use the given initrd file to boot from')
 
-# child's cwd
-cwd = args.cwd if args.cwd is not None else os.getcwd()
+    parser.add_argument(
+        'cmd', metavar='X', nargs='+',
+        help='command and optional arguments to execute')
 
-# child's extra environment
-env = {}
-for spec in args.env:
-    parts = spec.replace('\n', r'\n').replace('\0', r'\0').split('=', 1)
-    if len(parts) != 2:
-        parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
-    env[parts[0].replace(' ', '_')] = parts[1]
+    return parser.parse_args(), parser
 
-# where to get stdin from
-childStdin = 'null' if args.no_stdin else 'fd:0'
+# build the UML configuration and command
 
-# keep init's stdout?
-initStdout = args.debug or args.verbose
+def main():
+    args, parser = parse_args()
 
-# find initrd
-initrd = bindir + "/../lib/umlbox/umlbox-initrd.gz"
-if not os.path.exists(initrd):
-    initrd = bindir + "/umlbox-initrd.gz"
-if not os.path.exists(initrd):
-    print("Could not find umlbox-initrd.gz")
-    sys.exit(1)
-if args.verbose:
-    print("Found initrd " + initrd)
+    finder = Finder()
+    istty = os.isatty(1)
 
-# sanity check the environment
-if not ("HOME" in os.environ):
-    # UML barfs if it doesn't have a HOME
-    os.environ["HOME"] = "/tmp"
+    # the command to run
+    cmd = ["'" + arg.replace("'", "'\\\''").replace("\n", "'\\n'") + "'"
+           for arg in args.cmd]
 
-# make the basic setup
-confs = ("setgid " + gid + "\n" +
-         "setuid " + uid + "\n")
-ttycat = ""
-if not istty:
-    confs += "ttyraw\n"
-    ttycat = " | cat"
+    # the mount points
+    Mount = collections.namedtuple('Mount', 'rrw host guest')
+    mounts = {}
+    if args.base_mounts:
+        for m in ('/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/etc/alternatives', '/dev'):
+            if os.path.isdir(m):
+                mounts[m] = Mount(rrw='r', host=m, guest=m)
+    for rrw, specs in (('r', args.mount), ('rw', args.mount_write)):
+        for spec in specs:
+            mdir = os.path.abspath(spec)
+            mounts[mdir] = Mount(rrw=rrw, host=mdir, guest=mdir)
+    for rrw, specs in (('r', args.translate), ('rw', args.translate_write)):
+        for guest, host in specs:
+            mdir = os.path.abspath(host)
+            mounts[guest] = Mount(rrw=rrw, host=mdir, guest=guest)
 
-# figure out the hostmount configuration
-mountPaths = list(mounts.keys())
-mountPaths.sort(key=lambda x: len(x))
+    # kernel
+    linux = finder.locate(args.linux, 'umlbox-linux', 'linux', '/usr/bin/linux')
+    if linux is None:
+        parser.error('could not find UML kernel; set --linux?')
+    if args.verbose:
+        print("Found UML kernel " + linux)
 
-# and make the hostmount commands
-for path in mountPaths:
-    mount = mounts[path]
-    confs += "hostmount " + mount.rrw + " " + mount.host + " " + mount.guest + "\n"
+    # mudem
+    mudem = finder.locate(args.mudem, 'umlbox-mudem')
+    mudemHost = [mudem, '0']
+    mudemGuest = [mudem, '1']
+    for spec in args.local:
+        parts = spec.split(":")
+        if len(parts) != 2:
+            parser.error('expected --local H:G, got --local "{}"'.format(spec))
+        mudemHost.append('tcp4-listen:{}'.format(parts[0]))
+        mudemGuest.append('tcp4:127.0.0.1:{}'.format(parts[1]))
+    for spec in args.remote:
+        parts = spec.split(":")
+        if len(parts) != 3:
+            parser.error('expected --remote G:A:P, got --remote "{}"'.format(spec))
+        mudemHost.append('tcp4:{}:{}'.format(parts[1], parts[2]))
+        mudemGuest.append('tcp4-listen:{}'.format(parts[0]))
+    if args.x11:
+        mudemHost.append('unix:/tmp/.X11-unix/X0')
+        mudemGuest.append('tcp4-listen:6000')
+    if mudem is None and len(mudemHost) > 2:
+        parser.error('could not find umlbox-mudem; set --mudem?')
 
-# Filesystems/basic networking
-confs += ("mount tmpfs /tmp tmpfs\n" +
-          "mount proc /proc proc\n" +
-          "mount sysfs /sys sysfs\n" +
-          "run root / /sbin/ifconfig lo 127.0.0.1\n")
+    # child's cwd
+    cwd = args.cwd if args.cwd is not None else os.getcwd()
 
-# Full networking (if requested)
-if len(mudemGuest) > 2:
-    confs += ("input ../tty2\n" +
-              "output ../tty2\n" +
-              "error ../tty1\n" +
-              "ttyraw\n"
-              "daemon root / " + " ".join(mudemGuest) + "\n")
+    # child's extra environment
+    env = {}
+    for spec in args.env:
+        parts = spec.replace('\n', r'\n').replace('\0', r'\0').split('=', 1)
+        if len(parts) != 2:
+            parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
+        env[parts[0].replace(' ', '_')] = parts[1]
 
-# Process control
-confs += ("timeout " + str(args.timeout) + "\n" +
-          "input ../tty1\n" +
-          "output ../tty1\n")
-if not istty:
-    confs += "ttyraw\n"
+    # where to get stdin from
+    childStdin = 'null' if args.no_stdin else 'fd:0'
 
-# Extra environment variables
-for k, v in env.items():
-    confs += "env " + k + " " + v + "\n"
+    # keep init's stdout?
+    initStdout = args.debug or args.verbose
 
-# And finally, the command
-runas = 'root' if args.root else 'user'
-confs += "run " + runas + " " + cwd + " " + " ".join(cmd) + ttycat + "\n"
-if args.verbose:
-    print("Configuration:\n" + confs + "\n")
+    # find initrd
+    initrd = finder.locate(args.initrd, 'umlbox-initrd.gz')
+    if initrd is None:
+        parser.error('could not find umlbox-initrd.gz; set --initrd?')
+    if args.verbose:
+        print("Found initrd " + initrd)
 
-# Pad to block boundary, to avoid ubd from wrapping around
-if len(confs) % 512 != 0:
-    confs += "\0" * (512 - len(confs) % 512)
+    # sanity check the environment
+    if not ("HOME" in os.environ):
+        # UML barfs if it doesn't have a HOME
+        os.environ["HOME"] = "/tmp"
 
-# Write out the configuration
-conff = open(conf, "w")
-conff.write(confs)
-conff.close()
+    # make the basic setup
+    confs = 'setuid {}\nsetgid {}\n'.format(os.getuid(), os.getgid())
+    ttycat = ""
+    if not istty:
+        confs += "ttyraw\n"
+        ttycat = " | cat"
 
-# open all our new pipes
-childStdout = os.dup(1) # To keep output
-devnullw = os.open("/dev/null", os.O_WRONLY)
-stdoutw = devnullw
-stdoutws = "null"
-if initStdout:
-    stdoutw = None
-    stdoutws = "fd:1"
-passFds = [childStdout]
+    # figure out the hostmount configuration
+    mountPaths = list(mounts.keys())
+    mountPaths.sort(key=lambda x: len(x))
 
-# Our mudem host
-mudemProc = None
-mudemRedir = "null"
-if len(mudemHost) > 2:
-    mudemProc = subprocess.Popen(mudemHost, stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, close_fds=False)
-    mudemOut, mudemIn = mudemProc.stdout.fileno(), mudemProc.stdin.fileno()
-    mudemRedir = 'fd:{},fd:{}'.format(mudemOut, mudemIn)
-    passFds.extend([mudemOut, mudemIn])
+    # and make the hostmount commands
+    for path in mountPaths:
+        mount = mounts[path]
+        confs += "hostmount " + mount.rrw + " " + mount.host + " " + mount.guest + "\n"
 
-cmd = [linux, "initrd=" + initrd, "ubda=" + conf, "mem=" + args.memory,
-    "con1=" + childStdin + ",fd:" + str(childStdout),
-    "con2=" + mudemRedir,
-    "con=null," + stdoutws]
-if args.verbose:
-    print("Command: " + str(cmd))
-    sys.stdout.flush()
+    # Filesystems/basic networking
+    confs += ("mount tmpfs /tmp tmpfs\n" +
+              "mount proc /proc proc\n" +
+              "mount sysfs /sys sysfs\n" +
+              "run root / /sbin/ifconfig lo 127.0.0.1\n")
 
-subprocess.run(cmd, stdout=stdoutw, stderr=devnullw, pass_fds=passFds)
-os.close(devnullw)
-os.close(childStdout)
+    # Full networking (if requested)
+    if len(mudemGuest) > 2:
+        confs += ("input ../tty2\n" +
+                  "output ../tty2\n" +
+                  "error ../tty1\n" +
+                  "ttyraw\n"
+                  "daemon root / " + " ".join(mudemGuest) + "\n")
 
-if mudemProc != None:
-    mudemProc.terminate()
+    # Process control
+    confs += ("timeout " + str(args.timeout) + "\n" +
+              "input ../tty1\n" +
+              "output ../tty1\n")
+    if not istty:
+        confs += "ttyraw\n"
 
-os.unlink(conf)
+    # Extra environment variables
+    for k, v in env.items():
+        confs += "env " + k + " " + v + "\n"
+
+    # And finally, the command
+    runas = 'root' if args.root else 'user'
+    confs += "run " + runas + " " + cwd + " " + " ".join(cmd) + ttycat + "\n"
+    if args.verbose:
+        print("Configuration:\n" + confs + "\n")
+
+    # Pad to block boundary, to avoid ubd from wrapping around
+    if len(confs) % 512 != 0:
+        confs += "\0" * (512 - len(confs) % 512)
+
+    # open all our new pipes
+    childStdout = os.dup(1) # To keep output
+    devnullw = os.open("/dev/null", os.O_WRONLY)
+    stdoutw = devnullw
+    stdoutws = "null"
+    if initStdout:
+        stdoutw = None
+        stdoutws = "fd:1"
+    passFds = [childStdout]
+
+    # Our mudem host
+    mudemProc = None
+    mudemRedir = "null"
+    if len(mudemHost) > 2:
+        mudemProc = subprocess.Popen(
+            mudemHost, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, close_fds=False)
+        mudemOut, mudemIn = mudemProc.stdout.fileno(), mudemProc.stdin.fileno()
+        mudemRedir = 'fd:{},fd:{}'.format(mudemOut, mudemIn)
+        passFds.extend([mudemOut, mudemIn])
+
+    cmd = [linux, "initrd=" + initrd, "mem=" + args.memory,
+           "con1=" + childStdin + ",fd:" + str(childStdout),
+           "con2=" + mudemRedir,
+           "con=null," + stdoutws]
+    if args.verbose:
+        print("Command: " + str(cmd))
+        sys.stdout.flush()
+
+    # Write out the configuration and run the UML kernel
+    with tempfile.NamedTemporaryFile(prefix='umlbox-', suffix='.conf') as conf:
+        conf.write(confs.encode())
+        conf.flush()
+        cmd.append('ubda=' + conf.name)
+        subprocess.run(cmd, stdout=stdoutw, stderr=devnullw, pass_fds=passFds)
+
+    os.close(devnullw)
+    os.close(childStdout)
+
+    if mudemProc != None:
+        mudemProc.terminate()
+
+# utilities
+
+class Finder:
+    def __init__(self):
+        self._cwd = os.path.abspath('.')
+        self._bin = os.path.abspath(os.path.dirname(sys.argv[0]))
+
+    def locate(self, arg, *names):
+        if arg is not None:
+            return arg
+        for name in names:
+            path = os.path.join(self._cwd, name)
+            if os.path.exists(path):
+                return path
+            path = os.path.join(self._bin, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+if __name__ == '__main__':
+    main()
