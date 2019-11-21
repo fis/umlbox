@@ -27,10 +27,7 @@ def parse_args():
 
     parser.add_argument(
         '--verbose', '-v', action='store_true',
-        help='verbose mode')
-    parser.add_argument(
-        '--debug', action='store_true',
-        help='keep UML kernel and init output visible')
+        help='verbose mode: show debugging output')
 
     group = parser.add_argument_group('mount options')
     group.add_argument(
@@ -136,23 +133,23 @@ def main():
 
     # mudem
     mudem = finder.locate(args.mudem, 'umlbox-mudem')
-    mudemHost = [mudem, '0']
-    mudemGuest = [mudem, '1']
+    mudem_host = [mudem, '0']
+    mudem_guest = [mudem, '1']
     for spec in args.local:
         parts = spec.split(":")
         if len(parts) != 2:
             parser.error('expected --local H:G, got --local "{}"'.format(spec))
-        mudemHost.append('tcp4-listen:{}'.format(parts[0]))
-        mudemGuest.append('tcp4:127.0.0.1:{}'.format(parts[1]))
+        mudem_host.append('tcp4-listen:{}'.format(parts[0]))
+        mudem_guest.append('tcp4:127.0.0.1:{}'.format(parts[1]))
     for spec in args.remote:
         parts = spec.split(":")
         if len(parts) != 3:
             parser.error('expected --remote G:A:P, got --remote "{}"'.format(spec))
-        mudemHost.append('tcp4:{}:{}'.format(parts[1], parts[2]))
-        mudemGuest.append('tcp4-listen:{}'.format(parts[0]))
+        mudem_host.append('tcp4:{}:{}'.format(parts[1], parts[2]))
+        mudem_guest.append('tcp4-listen:{}'.format(parts[0]))
     if args.x11:
-        mudemHost.append('unix:/tmp/.X11-unix/X0')
-        mudemGuest.append('tcp4-listen:6000')
+        mudem_host.append('unix:/tmp/.X11-unix/X0')
+        mudem_guest.append('tcp4-listen:6000')
     if mudem is None and len(mudemHost) > 2:
         parser.error('could not find umlbox-mudem; set --mudem?')
 
@@ -166,12 +163,6 @@ def main():
         if len(parts) != 2:
             parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
         env[parts[0].replace(' ', '_')] = parts[1]
-
-    # where to get stdin from
-    childStdin = 'null' if args.no_stdin else 'fd:0'
-
-    # keep init's stdout?
-    initStdout = args.debug or args.verbose
 
     # find initrd
     initrd = finder.locate(args.initrd, 'umlbox-initrd.gz')
@@ -208,12 +199,12 @@ def main():
               "run root / /sbin/ifconfig lo 127.0.0.1\n")
 
     # Full networking (if requested)
-    if len(mudemGuest) > 2:
+    if len(mudem_guest) > 2:
         confs += ("input ../tty2\n" +
                   "output ../tty2\n" +
                   "error ../tty1\n" +
                   "ttyraw\n"
-                  "daemon root / " + " ".join(mudemGuest) + "\n")
+                  "daemon root / " + " ".join(mudem_guest) + "\n")
 
     # Process control
     confs += ("timeout " + str(args.timeout) + "\n" +
@@ -236,47 +227,42 @@ def main():
     if len(confs) % 512 != 0:
         confs += "\0" * (512 - len(confs) % 512)
 
-    # open all our new pipes
-    childStdout = os.dup(1) # To keep output
-    devnullw = os.open("/dev/null", os.O_WRONLY)
-    stdoutw = devnullw
-    stdoutws = "null"
-    if initStdout:
-        stdoutw = None
-        stdoutws = "fd:1"
-    passFds = [childStdout]
+    # set up UML communication lines
+    cmd_fd = os.dup(1)
+    debug_fd = 2 if args.verbose else subprocess.DEVNULL
+    pass_fds = [cmd_fd]
+
+    cmd_con = '{},fd:{}'.format('null' if args.no_stdin else 'fd:0', cmd_fd)
+    mudem_con = 'null'
+    debug_con = 'null,{}'.format('fd:2' if args.verbose else 'null')
 
     # Our mudem host
-    mudemProc = None
-    mudemRedir = "null"
-    if len(mudemHost) > 2:
-        mudemProc = subprocess.Popen(
-            mudemHost, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, close_fds=False)
-        mudemOut, mudemIn = mudemProc.stdout.fileno(), mudemProc.stdin.fileno()
-        mudemRedir = 'fd:{},fd:{}'.format(mudemOut, mudemIn)
-        passFds.extend([mudemOut, mudemIn])
-
-    cmd = [linux, "initrd=" + initrd, "mem=" + args.memory,
-           "con1=" + childStdin + ",fd:" + str(childStdout),
-           "con2=" + mudemRedir,
-           "con=null," + stdoutws]
-    if args.verbose:
-        print("Command: " + str(cmd))
-        sys.stdout.flush()
+    mudem_proc = None
+    if len(mudem_host) > 2:
+        mudem_proc = subprocess.Popen(mudem_host, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        mudem_out, mudem_in = mudem_proc.stdout.fileno(), mudem_proc.stdin.fileno()
+        mudem_con = 'fd:{},fd:{}'.format(mudem_out, mudem_in)
+        pass_fds.extend([mudem_out, mudem_in])
 
     # Write out the configuration and run the UML kernel
     with tempfile.NamedTemporaryFile(prefix='umlbox-', suffix='.conf') as conf:
         conf.write(confs.encode())
         conf.flush()
-        cmd.append('ubda=' + conf.name)
-        subprocess.run(cmd, stdout=stdoutw, stderr=devnullw, pass_fds=passFds)
 
-    os.close(devnullw)
-    os.close(childStdout)
+        cmd = [
+            linux, 'initrd=' + initrd,
+            'mem=' + args.memory,
+            'con1=' + cmd_con, 'con2=' + mudem_con, 'con=' + debug_con,
+            'ubda=' + conf.name,
+        ]
+        if args.verbose:
+            print("Command: " + str(cmd))
+            sys.stdout.flush()
+        subprocess.run(cmd, stdout=debug_fd, stderr=debug_fd, pass_fds=pass_fds)
 
-    if mudemProc != None:
-        mudemProc.terminate()
+    os.close(cmd_fd)
+    if mudem_proc != None:
+        mudem_proc.terminate()
 
 # utilities
 
