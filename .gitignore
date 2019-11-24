@@ -1,0 +1,9 @@
+/config.pb-c.*
+/config_pb2.py
+/init
+/init.o
+/mudem/deps
+/mudem/umlbox-mudem
+/mudem/*.o
+/umlbox-initrd.gz
+/umlbox-mudem
