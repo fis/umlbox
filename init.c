@@ -252,7 +252,6 @@ static void handle_run(const Run *run) {
     if (waited == -1 && errno == EINTR) {
       if (timeout_phase == 1) {
         if (child_running) MUST("kill (TERM)", -1, kill, child, SIGTERM);
-        if (cat_running) MUST("kill (cat, TERM)", -1, kill, cat, SIGTERM);
         timeout_phase = 2;
         struct itimerspec grace = { .it_value = { .tv_sec = 5 } };
         MUST("timer_settime (KILL)", -1, timer_settime, timeout_timer, 0, &grace, 0);
