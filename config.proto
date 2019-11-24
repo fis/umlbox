@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+// full umlbox configuration
+message Config {
+  // list of (tty) device names to set to raw mode before running
+  repeated string tty_raw = 1;
+  // list of mount points to perform
+  repeated Mount mount = 2;
+  // sequence of commands to execute
+  repeated Run run = 3;
+}
+
+// mount configuration
+message Mount {
+  // target mount point; directory will be created automatically
+  string target = 1;
+  // source device (if applicable) to mount
+  string source = 2;
+  // filesystem type
+  string fstype = 3;
+  // optional arguments, e.g. path for hostfs
+  string data = 4;
+  // mount as read-only
+  bool ro = 5;
+  // mount with nosuid flag
+  bool nosuid = 6;
+}
+
+// executable command configuration
+message Run {
+  // don't wait for the command to finish
+  bool daemon = 1;
+  // command to run, looked up as in execvp(2) inside the /host chroot
+  string cmd = 2;
+  // list of command-line arguments
+  repeated string arg = 3;
+  // initial working directory, inside the /host root
+  string cwd = 4;
+  // standard input, relative to real root; /null, /console and /ttyN are available
+  // if empty, /null by default
+  string input = 5;
+  // standard output, as above
+  // if empty, /null by default
+  string output = 6;
+  // standard error, as above
+  // if empty, merged with standard output
+  string error = 7;
+  // if true, start a 'cat' process to trick the command think stdout is not a terminal
+  bool cat_output = 8;
+  // custom environment variables to add in the child's environment
+  repeated EnvVar env = 9;
+  // if true, drop root privileges
+  bool user = 10;
+  // use this specific UID for the program
+  int32 uid = 11;
+  // use this specific GID for the program
+  int32 gid = 12;
+  // if non-zero, send SIGTERM to the process after this many seconds, and SIGKILL soon after
+  int32 timeout = 13;
+}
+
+message EnvVar {
+  string key = 1;
+  string value = 2;
+}

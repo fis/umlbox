@@ -1,6 +1,7 @@
 CC=gcc
-CFLAGS=-g -O3
-LDFLAGS=
+CFLAGS=-std=gnu11 -Os
+LDFLAGS=-Os
+LIBS=-lprotobuf-c -lrt -pthread
 STATICFLAGS=-static
 STRIP=strip
 LINUX=linux-3.7
@@ -14,9 +15,16 @@ nokernel: umlbox-initrd.gz umlbox-mudem
 umlbox-initrd.gz: init
 	echo init | cpio -H newc -o | gzip -9c > umlbox-initrd.gz
 
-init: init.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $(STATICFLAGS) init.c -o init
+init: init.o config.pb-c.o
+	$(CC) $(LDFLAGS) $(STATICFLAGS) -o $@ $^ $(LIBS)
 	$(STRIP) init
+
+init.o: init.c config.pb-c.h
+
+config.pb-c.o: config.pb-c.c config.pb-c.h
+
+%.pb-c.c %.pb-c.h %_pb2.py: %.proto
+	protoc --python_out=. --c_out=. config.proto
 
 umlbox-mudem: mudem/umlbox-mudem
 	-$(STRIP) mudem/umlbox-mudem
@@ -38,7 +46,9 @@ $(LINUX)/.config: umlbox-config
 	cd $(LINUX) ; yes '' | $(MAKE) ARCH=um oldconfig
 
 clean:
-	rm -f umlbox-linux init umlbox-initrd.gz umlbox-mudem
+	$(RM) umlbox-linux init umlbox-initrd.gz umlbox-mudem
+	$(RM) init.o config.pb-c.o
+	$(RM) config.pb-c.c config.pb-c.h config_pb2.py
 	cd mudem && $(MAKE) clean
 	-cd $(LINUX) && $(MAKE) ARCH=um clean
 

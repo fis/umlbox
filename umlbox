@@ -16,9 +16,12 @@
 import argparse
 import collections
 import os
+import struct
 import subprocess
 import sys
 import tempfile
+
+import config_pb2
 
 # parse command-line arguments
 
@@ -100,41 +103,23 @@ def parse_args():
 
 def main():
     args, parser = parse_args()
-
     finder = Finder()
-    istty = os.isatty(1)
 
-    # the command to run
-    cmd = ["'" + arg.replace("'", "'\\\''").replace("\n", "'\\n'") + "'"
-           for arg in args.cmd]
+    # locate the necessary binaries
 
-    # the mount points
-    Mount = collections.namedtuple('Mount', 'rrw host guest')
-    mounts = {}
-    if args.base_mounts:
-        for m in ('/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/etc/alternatives', '/dev'):
-            if os.path.isdir(m):
-                mounts[m] = Mount(rrw='r', host=m, guest=m)
-    for rrw, specs in (('r', args.mount), ('rw', args.mount_write)):
-        for spec in specs:
-            mdir = os.path.abspath(spec)
-            mounts[mdir] = Mount(rrw=rrw, host=mdir, guest=mdir)
-    for rrw, specs in (('r', args.translate), ('rw', args.translate_write)):
-        for guest, host in specs:
-            mdir = os.path.abspath(host)
-            mounts[guest] = Mount(rrw=rrw, host=mdir, guest=guest)
-
-    # kernel
     linux = finder.locate(args.linux, 'umlbox-linux', 'linux', '/usr/bin/linux')
     if linux is None:
         parser.error('could not find UML kernel; set --linux?')
     if args.verbose:
         print("Found UML kernel " + linux)
 
-    # mudem
-    mudem = finder.locate(args.mudem, 'umlbox-mudem')
-    mudem_host = [mudem, '0']
-    mudem_guest = [mudem, '1']
+    initrd = finder.locate(args.initrd, 'umlbox-initrd.gz')
+    if initrd is None:
+        parser.error('could not find umlbox-initrd.gz; set --initrd?')
+    if args.verbose:
+        print("Found initrd " + initrd)
+
+    mudem, mudem_host, mudem_guest = None, [], []
     for spec in args.local:
         parts = spec.split(":")
         if len(parts) != 2:
@@ -150,84 +135,75 @@ def main():
     if args.x11:
         mudem_host.append('unix:/tmp/.X11-unix/X0')
         mudem_guest.append('tcp4-listen:6000')
-    if mudem is None and len(mudemHost) > 2:
-        parser.error('could not find umlbox-mudem; set --mudem?')
+    if mudem_host:
+        mudem = finder.locate(args.mudem, 'umlbox-mudem')
+        if mudem is None:
+            parser.error('could not find umlbox-mudem; set --mudem?')
 
-    # child's cwd
-    cwd = args.cwd if args.cwd is not None else os.getcwd()
-
-    # child's extra environment
-    env = {}
-    for spec in args.env:
-        parts = spec.replace('\n', r'\n').replace('\0', r'\0').split('=', 1)
-        if len(parts) != 2:
-            parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
-        env[parts[0].replace(' ', '_')] = parts[1]
-
-    # find initrd
-    initrd = finder.locate(args.initrd, 'umlbox-initrd.gz')
-    if initrd is None:
-        parser.error('could not find umlbox-initrd.gz; set --initrd?')
-    if args.verbose:
-        print("Found initrd " + initrd)
-
-    # sanity check the environment
-    if not ("HOME" in os.environ):
-        # UML barfs if it doesn't have a HOME
+    if not ("HOME" in os.environ): # required by UML
         os.environ["HOME"] = "/tmp"
 
-    # make the basic setup
-    confs = 'setuid {}\nsetgid {}\n'.format(os.getuid(), os.getgid())
-    ttycat = ""
-    if not istty:
-        confs += "ttyraw\n"
-        ttycat = " | cat"
+    # prepare the config file
 
-    # figure out the hostmount configuration
-    mountPaths = list(mounts.keys())
-    mountPaths.sort(key=lambda x: len(x))
+    cfg = config_pb2.Config()
 
-    # and make the hostmount commands
-    for path in mountPaths:
-        mount = mounts[path]
-        confs += "hostmount " + mount.rrw + " " + mount.host + " " + mount.guest + "\n"
+    if not os.isatty(1): cfg.tty_raw.append('/tty1')
+    if args.verbose and not os.isatty(2): cfg.tty_raw.append('/console')
 
-    # Filesystems/basic networking
-    confs += ("mount tmpfs /tmp tmpfs\n" +
-              "mount proc /proc proc\n" +
-              "mount sysfs /sys sysfs\n" +
-              "run root / /sbin/ifconfig lo 127.0.0.1\n")
+    mounts = {
+        '/tmp': config_pb2.Mount(target='/tmp', source='tmpfs', fstype='tmpfs'),
+        '/proc': config_pb2.Mount(target='/proc', source='proc', fstype='proc'),
+        '/sys': config_pb2.Mount(target='/sys', source='sysfs', fstype='sysfs'),
+    }
+    if args.base_mounts:
+        for m in ('/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/etc/alternatives', '/dev'):
+            if os.path.isdir(m):
+                mounts[m] = host_mount(target=m, host=m, ro=True)
+    for ro, specs in ((True, args.mount), (False, args.mount_write)):
+        for spec in specs:
+            mdir = os.path.abspath(spec)
+            mounts[mdir] = host_mount(target=mdir, host=mdir, ro=ro)
+    for ro, specs in ((True, args.translate), (False, args.translate_write)):
+        for guest, host in specs:
+            mdir = os.path.abspath(host)
+            mounts[guest] = host_mount(target=guest, host=host, ro=ro)
+    for mdir in sorted(mounts.keys(), key=lambda m: (len(m), m)):
+        cfg.mount.extend([mounts[mdir]])
 
-    # Full networking (if requested)
-    if len(mudem_guest) > 2:
-        confs += ("input ../tty2\n" +
-                  "output ../tty2\n" +
-                  "error ../tty1\n" +
-                  "ttyraw\n"
-                  "daemon root / " + " ".join(mudem_guest) + "\n")
+    cfg.run.add(cmd='/sbin/ip', arg=['addr', 'add', '127.0.0.1/8', 'dev', 'lo'], output='/console')
+    cfg.run.add(cmd='/sbin/ip', arg=['link', 'set', 'lo', 'up'], output='/console')
 
-    # Process control
-    confs += ("timeout " + str(args.timeout) + "\n" +
-              "input ../tty1\n" +
-              "output ../tty1\n")
-    if not istty:
-        confs += "ttyraw\n"
+    if mudem_guest:
+        cfg.tty_raw.append('/tty2')
+        cfg.run.add(
+            daemon=True,
+            cmd=mudem, arg=['1'] + mudem_guest,
+            input='/tty2', output='/tty2', error='/tty1')
 
-    # Extra environment variables
-    for k, v in env.items():
-        confs += "env " + k + " " + v + "\n"
+    cmd = cfg.run.add(
+        cmd=args.cmd[0], arg=args.cmd[1:],
+        cwd=args.cwd if args.cwd is not None else os.getcwd(),
+        input='/null' if args.no_stdin else '/tty1', output='/tty1',
+        cat_output=not os.isatty(1),
+        user=not args.root, uid=os.getuid(), gid=os.getgid(),
+        timeout=args.timeout)
+    for spec in args.env:
+        parts = spec.split('=', 1)
+        if len(parts) != 2:
+            parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
+        cmd.env.add(key=parts[0], value=parts[1])
 
-    # And finally, the command
-    runas = 'root' if args.root else 'user'
-    confs += "run " + runas + " " + cwd + " " + " ".join(cmd) + ttycat + "\n"
     if args.verbose:
-        print("Configuration:\n" + confs + "\n")
+        print('Configuration:\n{}'.format(cfg))
+        sys.stdout.flush()
 
-    # Pad to block boundary, to avoid ubd from wrapping around
-    if len(confs) % 512 != 0:
-        confs += "\0" * (512 - len(confs) % 512)
+    cfg = cfg.SerializeToString()
+    cfg = struct.pack('=LL', 0xdeadbeef, len(cfg)) + cfg
+    if len(cfg) % 512 != 0:  # ubd file must be padded to block boundary
+        cfg += b'\0' * (512 - len(cfg) % 512)
 
-    # set up UML communication lines
+    # execute UML
+
     cmd_fd = os.dup(1)
     debug_fd = 2 if args.verbose else subprocess.DEVNULL
     pass_fds = [cmd_fd]
@@ -236,32 +212,30 @@ def main():
     mudem_con = 'null'
     debug_con = 'null,{}'.format('fd:2' if args.verbose else 'null')
 
-    # Our mudem host
     mudem_proc = None
-    if len(mudem_host) > 2:
-        mudem_proc = subprocess.Popen(mudem_host, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    if mudem_host:
+        mudem_proc = subprocess.Popen([mudem, '0'] + mudem_host, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         mudem_out, mudem_in = mudem_proc.stdout.fileno(), mudem_proc.stdin.fileno()
         mudem_con = 'fd:{},fd:{}'.format(mudem_out, mudem_in)
         pass_fds.extend([mudem_out, mudem_in])
 
-    # Write out the configuration and run the UML kernel
-    with tempfile.NamedTemporaryFile(prefix='umlbox-', suffix='.conf') as conf:
-        conf.write(confs.encode())
-        conf.flush()
+    with tempfile.NamedTemporaryFile(prefix='umlbox-', suffix='.pb') as cfgf:
+        cfgf.write(cfg)
+        cfgf.flush()
 
         cmd = [
             linux, 'initrd=' + initrd,
             'mem=' + args.memory,
             'con1=' + cmd_con, 'con2=' + mudem_con, 'con=' + debug_con,
-            'ubda=' + conf.name,
+            'ubda=' + cfgf.name,
         ]
         if args.verbose:
-            print("Command: " + str(cmd))
-            sys.stdout.flush()
+            print('Command: {}\n'.format(cmd))
+
         subprocess.run(cmd, stdout=debug_fd, stderr=debug_fd, pass_fds=pass_fds)
 
     os.close(cmd_fd)
-    if mudem_proc != None:
+    if mudem_proc is not None:
         mudem_proc.terminate()
 
 # utilities
@@ -282,6 +256,10 @@ class Finder:
             if os.path.exists(path):
                 return path
         return None
+
+def host_mount(target, host, ro):
+    if not host.endswith('/'): host += '/'
+    return config_pb2.Mount(target=target, source='none', fstype='hostfs', data=host, ro=ro, nosuid=True)
 
 if __name__ == '__main__':
     main()

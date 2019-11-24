@@ -14,15 +14,17 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#define _BSD_SOURCE /* for random, environment stuff, mknod, etc */
-#define _POSIX_SOURCE /* for kill */
-
+#include <errno.h>
 #include <fcntl.h>
+#include <linux/reboot.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -31,410 +33,329 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <linux/reboot.h>
-#include <sys/reboot.h>
+#include "config.pb-c.h"
 
-#define SF(_o, _f, _b, _a) \
-do { \
-    (_o) = (_f) _a; \
-    if ((_o) == (_b)) { \
-        perror(#_f #_a); \
-        crash(); \
-    } \
-} while(0)
+static void handle_tty_raw(const char *dev);
+static void handle_mount(const Mount *mnt);
+static void handle_run(const Run *run);
+static void handle_timeout(int sig, siginfo_t *info, void *ctx);
 
-void mkdirP(char *dir);
-void handleMount(char **saveptr);
-void handleHostMount(char **saveptr);
-void handleRun(int daemon, char **saveptr);
-void handleTimeout(char **saveptr);
-void handleInput(char **saveptr);
-void handleOutput(char **saveptr);
-void handleError(char **saveptr);
-void handleSetID(int u, char **saveptr);
-void handleTTYRaw(char **saveptr);
-void handleEnv(char **saveptr);
-void crash();
+static void fail(const char *msg);
+static void open_to(int new_fd, const char *path, int flags, int fallback_fd);
+static ssize_t readall(int fd, void *buf, size_t count);
+static void mkdirs(const char *dir);
+static void hostify(const char *cwd, bool user, uid_t uid, gid_t gid);
+static void dump_config(uint32_t len, const Config *cfg);
 
-unsigned int timeout = 0;
-int childI = 0, childO = 1, childE = 2;
-uid_t childUID = 0;
-gid_t childGID = 0;
+static int in_init = 1; // used to modify behavior of fail for children
 
-int main(int argc, char **argv)
+#define MUST(msg, err, func, ...) ({ \
+  __typeof__(err) ret = func(__VA_ARGS__); \
+  if (ret == err) fail(msg); \
+  ret; })
+
+int main()
 {
-    int tmpi, i, o;
-    int ubda;
-    char *buf, *line, *word, *lsaveptr, *wsaveptr;
-    size_t bufsz, bufused;
-    ssize_t rd;
+  srandom(time(NULL));
 
-    srandom(time(NULL));
+  // prepare initial environment
 
-    /* drop our environment */
-    if (clearenv() != 0) {
-        perror("clearenv");
-        exit(1);
+  MUST("mknod /console", -1, mknod, "/console", 0644 | S_IFCHR, makedev(5, 1));
+  open_to(0, "/console", O_RDONLY, -1);
+  open_to(1, "/console", O_WRONLY, -1);
+  open_to(2, "/console", O_WRONLY, -1);
+
+  printf("umlbox init\n");
+
+  MUST("mknod /ubda", -1, mknod, "/ubda", 0644 | S_IFBLK, makedev(98, 0));
+  MUST("mknod /null", -1, mknod, "/null", 0644 | S_IFCHR, makedev(1, 3));
+  {
+    char dev[sizeof "/ttyXX"];
+    for (int i = 1; i < 16; i++) {
+      snprintf(dev, sizeof dev, "/tty%d", i);
+      MUST("mknod /ttyN", -1, mknod, dev, 0644 | S_IFCHR, makedev(4, i));
     }
-    setenv("PATH", "/usr/local/bin:/bin:/usr/bin", 1);
-    setenv("TERM", "linux", 1);
-    setenv("HOME", "/tmp", 1);
+  }
 
-    /* try to get console */
-    mknod("/console", 0644 | S_IFCHR, makedev(5, 1));
-    i = open("/console", O_RDONLY);
-    o = open("/console", O_WRONLY);
-    if (i != 0) dup2(i, 0);
-    if (o != 1) dup2(o, 1);
-    if (o != 2) dup2(o, 2);
+  if (clearenv() != 0)
+    fail("clearenv");
+  setenv("PATH", "/usr/local/bin:/bin:/usr/bin", 1);
+  setenv("TERM", "linux", 1);
+  setenv("HOME", "/tmp", 1);
 
-    /* and tty1-15 */
-    SF(buf, malloc, NULL, (8));
-    for (i = 1; i < 16; i++) {
-        sprintf(buf, "/tty%d", i);
-        mknod(buf, 0644 | S_IFCHR, makedev(4, i));
-    }
-    free(buf);
+  MUST("mkdir /host", -1, mkdir, "/host", 0777u);
 
-    printf("\n----------\nUMLBox starting.\n----------\n\n");
+  {
+    struct sigaction act = {0};
+    act.sa_sigaction = handle_timeout;
+    act.sa_flags = SA_SIGINFO;
+    MUST("sigaction", -1, sigaction, SIGRTMIN, &act, NULL);
+  }
 
-    /* first make sure we can access ubda */
-    SF(tmpi, mknod, -1, ("/ubda", 0644 | S_IFBLK, makedev(98, 0)));
+  // parse the configuration
 
-    /* and a root */
-    SF(tmpi, mkdir, -1, ("/host", 0777));
+  Config *cfg;
+  {
+    int fd = MUST("open /ubda", -1, open, "/ubda", O_RDONLY);
 
-    /* read our configuration from it */
-    SF(ubda, open, -1, ("/ubda", O_RDONLY));
-    bufsz = 1024;
-    bufused = 0;
-    SF(buf, malloc, NULL, (bufsz));
-    while (1) {
-        rd = read(ubda, buf + bufused, bufsz - bufused);
-        if (rd > 0) {
-            bufused += rd;
-            if (bufused == bufsz) {
-                bufsz *= 2;
-                SF(buf, realloc, NULL, (buf, bufsz));
-            }
-        } else {
-            break;
-        }
-    }
-    buf[bufused] = '\0';
-    close(ubda);
-
-    fprintf(stderr, "\n----------\nRead configuration:\n----------\n%s----------\n\n", buf);
-
-    /* now perform the commands */
-    lsaveptr = NULL;
-    while ((line = strtok_r(lsaveptr ? NULL : buf, "\n", &lsaveptr))) {
-        fprintf(stderr, "$ %s\n", line);
-        word = strtok_r(line, " ", &wsaveptr);
-        if (word == NULL || word[0] == '#') continue;
-#define CMD(x) if (!strcmp(word, #x))
-        CMD(mount) {
-            handleMount(&wsaveptr);
-        } else CMD(hostmount) {
-            handleHostMount(&wsaveptr);
-        } else CMD(run) {
-            handleRun(0, &wsaveptr);
-        } else CMD(daemon) {
-            handleRun(1, &wsaveptr);
-        } else CMD(timeout) {
-            handleTimeout(&wsaveptr);
-        } else CMD(input) {
-            handleInput(&wsaveptr);
-        } else CMD(output) {
-            handleOutput(&wsaveptr);
-        } else CMD(error) {
-            handleError(&wsaveptr);
-        } else CMD(setuid) {
-            handleSetID(1, &wsaveptr);
-        } else CMD(setgid) {
-            handleSetID(0, &wsaveptr);
-        } else CMD(ttyraw) {
-            handleTTYRaw(&wsaveptr);
-        } else CMD(env) {
-            handleEnv(&wsaveptr);
-        } else {
-            fprintf(stderr, "Unrecognized command %s\n", word);
-            crash();
-        }
-#undef CMD
+    uint32_t hdr[2];
+    MUST("read /ubda header", -1, readall, fd, hdr, sizeof hdr);
+    if (hdr[0] != 0xdeadbeefu) {
+      printf("unexpected header: %#08x != 0xdeadbeef\n", (unsigned) hdr[0]);
+      errno = EINVAL, fail("bad /ubda header");
     }
 
-    fprintf(stderr, "\n----------\nUMLBox is terminating.\n----------\n\n");
+    uint8_t *data = MUST("malloc config", (void *) 0, malloc, hdr[1]);
+    MUST("read config", -1, readall, fd, data, hdr[1]);
+    cfg = config__unpack(0, hdr[1], data);
+    if (!cfg)
+      errno = EINVAL, fail("bad config");
 
-    sync();
+    close(fd);
+    dump_config(hdr[1], cfg);
+  }
+
+  // execute all the actions
+
+  for (size_t i = 0; i < cfg->n_tty_raw; i++)
+    handle_tty_raw(cfg->tty_raw[i]);
+
+  for (size_t i = 0; i < cfg->n_mount; i++)
+    handle_mount(cfg->mount[i]);
+
+  for (size_t i = 0; i < cfg->n_run; i++)
+    handle_run(cfg->run[i]);
+
+  sync();
+  reboot(LINUX_REBOOT_CMD_POWER_OFF);
+  return 0;
+}
+
+static void handle_tty_raw(const char *dev) {
+  printf("umlbox tty_raw: %s\n", dev);
+
+  int fd = MUST("open tty_raw", -1, open, dev, O_RDWR);
+
+  struct termios tio;
+  MUST("tcgetattr", -1, tcgetattr, fd, &tio);
+  cfmakeraw(&tio);
+  MUST("tcsetattr", -1, tcsetattr, fd, TCSANOW, &tio);
+
+  close(fd);
+}
+
+static void handle_mount(const Mount *mnt) {
+  char target[sizeof "/host/" + strlen(mnt->target)];
+  snprintf(target, sizeof target, "/host%s%s", *mnt->target == '/' ? "" : "/", mnt->target);
+
+  printf("umlbox mount: %s\n", target);
+
+  unsigned long flags = 0;
+  if (mnt->ro) flags |= MS_RDONLY;
+  if (mnt->nosuid) flags |= MS_NOSUID;
+
+  mkdirs(target);
+  MUST("mount", -1, mount, mnt->source, target, mnt->fstype, flags, *mnt->data ? mnt->data : NULL);
+}
+
+static void handle_run(const Run *run) {
+  printf("umlbox run: %s\n", run->cmd);
+
+  uid_t uid = run->uid;
+  gid_t gid = run->gid;
+  if (run->user) {
+    if (uid == 0) uid = random() % 995000 + 5000;
+    if (gid == 0) gid = random() % 995000 + 5000;
+  }
+
+  pid_t cat = -1;
+  int cat_pipe[2];
+  if (run->cat_output) {
+    MUST("pipe (cat)", -1, pipe, cat_pipe);
+
+    cat = MUST("fork", -1, fork);
+    if (cat == 0) {
+      in_init = 0;
+
+      MUST("dup2 (cat -> in)", -1, dup2, cat_pipe[0], 0);
+      open_to(1, *run->output ? run->output : "/null", O_WRONLY, -1);
+      open_to(2, *run->error ? run->error : 0, O_WRONLY, 1);
+      if (cat_pipe[0] > 2) close(cat_pipe[0]);
+      if (cat_pipe[1] > 2) close(cat_pipe[1]);
+
+      hostify(run->cwd, run->user, uid, gid);
+
+      char *argv[2] = {"cat", NULL};
+      MUST("execvp", -1, execvp, "cat", argv);
+      exit(0);
+    }
+  }
+
+  pid_t child = MUST("fork", -1, fork);
+  if (child == 0) {
+    in_init = 0;
+
+    open_to(0, *run->input ? run->input : "/null", O_RDONLY, -1);
+    if (cat != -1) {
+      if (cat_pipe[1] != 1) MUST("dup2 (cat -> out)", -1, dup2, cat_pipe[1], 1);
+      if (cat_pipe[1] != 2) MUST("dup2 (cat -> err)", -1, dup2, cat_pipe[1], 2);
+      if (cat_pipe[0] > 2) close(cat_pipe[0]);
+      if (cat_pipe[1] > 2) close(cat_pipe[1]);
+    } else {
+      open_to(1, *run->output ? run->output : "/null", O_WRONLY, -1);
+      open_to(2, *run->error ? run->error : 0, O_WRONLY, 1);
+    }
+
+    for (size_t i = 0; i < run->n_env; i++)
+      setenv(run->env[i]->key, run->env[i]->value, /* overwrite= */ 1);
+
+    hostify(run->cwd, run->user, uid, gid);
+
+    char **argv = MUST("malloc argv", (void *) 0, malloc, (run->n_arg + 2) * sizeof *argv);
+    argv[0] = run->cmd;
+    for (size_t i = 0; i < run->n_arg; i++)
+      argv[1 + i] = run->arg[i];
+    argv[1 + run->n_arg] = 0;
+
+    MUST("execvp", -1, execvp, argv[0], argv);
+    exit(0);
+  }
+
+  if (run->daemon)
+    return;
+
+  if (cat != -1) {
+    close(cat_pipe[0]);
+    close(cat_pipe[1]);
+  }
+
+  timer_t timeout_timer;
+  volatile int timeout_phase = 0;
+  if (run->timeout > 0) {
+    struct sigevent ev = {0};
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = SIGRTMIN;
+    ev.sigev_value.sival_ptr = (void *) &timeout_phase;
+    MUST("timer_create", -1, timer_create, CLOCK_MONOTONIC, &ev, &timeout_timer);
+    struct itimerspec timeout = {{0, 0}, {run->timeout, 0}};
+    MUST("timer_settime (TERM)", -1, timer_settime, timeout_timer, 0, &timeout, 0);
+  }
+
+  bool child_running = 1, cat_running = run->cat_output;
+  while (child_running || cat_running) {
+    pid_t waited = wait(0);
+    if (waited == -1 && errno == EINTR) {
+      if (timeout_phase == 1) {
+        if (child_running) MUST("kill (TERM)", -1, kill, child, SIGTERM);
+        if (cat_running) MUST("kill (cat, TERM)", -1, kill, cat, SIGTERM);
+        timeout_phase = 2;
+        struct itimerspec grace = {{0, 0}, {5, 0}};
+        MUST("timer_settime (KILL)", -1, timer_settime, timeout_timer, 0, &grace, 0);
+      } else if (timeout_phase == 3) {
+        if (child_running) MUST("kill (KILL)", -1, kill, child, SIGKILL);
+        if (cat_running) MUST("kill (cat, KILL)", -1, kill, cat, SIGKILL);
+      }
+      continue;
+    }
+    if (waited == -1)
+      fail("wait");
+
+    if (waited == child) child_running = false;
+    if (waited == cat) cat_running = false;
+  }
+  if (run->timeout > 0)
+    timer_delete(timeout_timer);
+}
+
+static void handle_timeout(int sig, siginfo_t *info, void *ctx) {
+  volatile int *phase = (volatile int*) info->si_ptr;
+  ++*phase;
+  // wait already interrupted by this signal
+}
+
+// utilities
+
+static void fail(const char *msg) {
+  printf("umlbox: %s: %s\n", msg, strerror(errno));
+  if (in_init)
     reboot(LINUX_REBOOT_CMD_POWER_OFF);
-
-    return 0;
+  exit(1);
 }
 
-void mkdirP(char *dir)
-{
-    int tmpi;
-    char *tdir, *elem, *saveptr;
+static void open_to(int new_fd, const char *path, int flags, int fallback_fd) {
+  int fd = fallback_fd;
+  bool do_open = path && *path;
+  if (do_open) fd = MUST("open", -1, open, path, flags);
+  if (fd != -1 && fd != new_fd) {
+    MUST("dup2", -1, dup2, fd, new_fd);
+    if (do_open) close(fd);
+  }
+}
 
-    /* start at the root */
-    SF(tmpi, chdir, -1, ("/"));
-
-    /* then work through the dir */
-    SF(tdir, strdup, NULL, (dir));
-    saveptr = NULL;
-    while ((elem = strtok_r(saveptr ? NULL : tdir, "/", &saveptr))) {
-        if (elem[0]) {
-            /* best effort mkdir */
-            mkdir(elem, 0777);
-
-            /* then must-succeed chdir */
-            SF(tmpi, chdir, -1, (elem));
-        }
+static ssize_t readall(int fd, void* buf, size_t count) {
+  char* at = (char*) buf;
+  size_t got = 0;
+  while (got < count) {
+    ssize_t chunk = read(fd, at, count - got);
+    if (chunk < 0)
+      return -1;
+    if (chunk == 0) {
+      errno = EPIPE;
+      return -1;
     }
-    free(tdir);
-    SF(tmpi, chdir, -1, ("/"));
+    at += chunk;
+    got -= chunk;
+  }
+  return count;
 }
 
-void handleMount(char **saveptr)
-{
-    int tmpi;
-    char *source, *target, *rtarget, *type, *data;
+static void mkdirs(const char *dir) {
+  MUST("chdir /", -1, chdir, "/");
 
-    /* get our options */
-    SF(source, strtok_r, NULL, (NULL, " ", saveptr));
-    SF(target, strtok_r, NULL, (NULL, " ", saveptr));
-    SF(type, strtok_r, NULL, (NULL, " ", saveptr));
+  char buf[strlen(dir)+1];
+  strcpy(buf, dir);
 
-    /* data is optional */
-    data = strtok_r(NULL, " ", saveptr);
-
-    /* make the target directory */
-    SF(rtarget, malloc, NULL, (strlen(target) + 7));
-    sprintf(rtarget, "/host/%s", target);
-    mkdirP(rtarget);
-
-    /* then mount it */
-    SF(tmpi, mount, -1, (source, rtarget, type, 0, data));
-    free(rtarget);
-}
-
-void handleHostMount(char **saveptr)
-{
-    int tmpi;
-    char *rrw, *host, *rhost, *guest, *rguest;
-    unsigned long flags;
-
-    /* get our options */
-    SF(rrw, strtok_r, NULL, (NULL, " ", saveptr));
-    SF(host, strtok_r, NULL, (NULL, " ", saveptr));
-    SF(guest, strtok_r, NULL, (NULL, " ", saveptr));
-
-    /* figure out the flags */
-    flags = MS_NOSUID;
-    if (!strcmp(rrw, "r")) {
-        flags |= MS_RDONLY;
-    } else if (!strcmp(rrw, "rw")) {
-        /* rd/rw, default */
+  char *tail = buf;
+  do {
+    char *part = tail;
+    char *slash = strchr(tail, '/');
+    if (slash) {
+      *slash = 0;
+      tail = slash + 1;
     } else {
-        fprintf(stderr, "Unrecognized hostmount flag %s\n", rrw);
-        exit(1);
+      tail = 0;
     }
+    if (!*part)
+      continue;
+    mkdir(part, 0777);
+    MUST("chdir", -1, chdir, part);
+  } while (tail);
 
-    /* make the host directory */
-    SF(rhost, malloc, NULL, (strlen(host) + 2));
-    sprintf(rhost, "%s/", host);
-
-    /* make the guest directory */
-    SF(rguest, malloc, NULL, (strlen(guest) + 6));
-    sprintf(rguest, "/host%s", guest);
-    mkdirP(rguest);
-
-    /* then mount it */
-    SF(tmpi, mount, -1, ("none", rguest, "hostfs", flags, rhost));
-    free(rguest);
-    free(rhost);
+  MUST("chdir /", -1, chdir, "/");
 }
 
-void handleRun(int daemon, char **saveptr)
-{
-    char *ru, *dir, *cmd;
-    pid_t pid, spid;
-    int user;
+static void hostify(const char *cwd, bool user, uid_t uid, gid_t gid) {
+  MUST("chdir root", -1, chdir, "/host");
+  MUST("chroot", -1, chroot, ".");
+  if (*cwd) MUST("chdir cwd", -1, chdir, cwd);
 
-    /* root or user? */
-    SF(ru, strtok_r, NULL, (NULL, " ", saveptr));
-    if (!strcmp(ru, "root")) {
-        user = 0;
-    } else if (!strcmp(ru, "user")) {
-        user = 1;
-    } else {
-        fprintf(stderr, "Use: run <root|user> <dir> <cmd>\n");
-        exit(1);
-    }
-
-    /* read the dir */
-    SF(dir, strtok_r, NULL, (NULL, " ", saveptr));
-
-    /* read the command (remainder of the buffer) */
-    SF(cmd, strtok_r, NULL, (NULL, "\n", saveptr));
-
-    /* and run it, chrooted */
-    srandom(random());
-    SF(pid, fork, -1, ());
-    if (pid == 0) {
-        int tmpi;
-
-        /* I/O redirection */
-        if (childI != 0) dup2(childI, 0);
-        if (childO != 1) dup2(childO, 1);
-        if (childE != 2) dup2(childE, 2);
-
-        /* chroot */
-        SF(tmpi, chdir, -1, ("/host"));
-        SF(tmpi, chroot, -1, ("/host"));
-        tmpi = chdir(dir);
-        (void) tmpi;
-
-        /* randomize GID/UID */
-        if (user) {
-            if (childUID == 0)
-                childUID = random() % 995000 + 5000;
-            if (childGID == 0)
-                childGID = random() % 995000 + 5000;
-            SF(tmpi, setgid, -1, (childGID));
-            SF(tmpi, setuid, -1, (childUID));
-        }
-
-        /* and run */
-        SF(tmpi, system, -1, (cmd));
-        if (WEXITSTATUS(tmpi) == 127) {
-            fprintf(stderr, "/bin/sh could not be executed\n");
-            close(0);
-
-            /* attempt to give some debugging output */
-            close(0);
-            tmpi = execl("/bin/sh", "/bin/sh", NULL);
-            perror("/bin/sh");
-        }
-        exit(0);
-        while (1) sleep(60*60*24);
-    }
-
-    if (!daemon) {
-        /* as well as a pid to do the timeout */
-        if (timeout != 0) {
-            SF(spid, fork, -1, ());
-            if (spid == 0) {
-                sleep(timeout);
-                exit(0);
-                while (1) sleep(60*60*24);
-            }
-
-            if (wait(NULL) == spid) {
-                /* kill it */
-                kill(pid, SIGKILL);
-                waitpid(pid, NULL, 0);
-            }
-
-        } else {
-            waitpid(pid, NULL, 0);
-
-        }
-    }
+  if (user) {
+    MUST("setgid", -1, setgid, gid);
+    MUST("setuid", -1, setuid, uid);
+  }
 }
 
-void handleTimeout(char **saveptr)
-{
-    char *timeouts;
+static void dump_config(uint32_t len, const Config *cfg) {
+  printf("umlbox config: %u bytes:\n", len);
 
-    /* get the timeout */
-    SF(timeouts, strtok_r, NULL, (NULL, "\n", saveptr));
-    timeout = atoi(timeouts);
-}
+  for (size_t i = 0; i < cfg->n_tty_raw; i++)
+    printf("- tty_raw: %s\n", cfg->tty_raw[i]);
 
-void handleInput(char **saveptr)
-{
-    char *file, *rfile;
-    SF(file, strtok_r, NULL, (NULL, "\n", saveptr));
+  for (size_t i = 0; i < cfg->n_mount; i++) {
+    const Mount *m = cfg->mount[i];
+    printf("- mount: %s ('%s', '%s', '%s', %d, %d)\n", m->target, m->source, m->fstype, m->data, m->ro, m->nosuid);
+  }
 
-    SF(rfile, malloc, NULL, (strlen(file) + 7));
-    sprintf(rfile, "/host/%s", file);
-
-    if (childI != 0) close(childI);
-    SF(childI, open, -1, (rfile, O_RDONLY));
-    free(rfile);
-}
-
-void handleOutput(char **saveptr)
-{
-    char *file, *rfile;
-    SF(file, strtok_r, NULL, (NULL, "\n", saveptr));
-
-    SF(rfile, malloc, NULL, (strlen(file) + 7));
-    sprintf(rfile, "/host/%s", file);
-
-    if (childO != 1) close(childO);
-    if (childE != 2) close(childE);
-    SF(childO, open, -1, (rfile, O_WRONLY|O_CREAT, 0666));
-    free(rfile);
-    SF(childE, dup, -1, (childO));
-}
-
-void handleError(char **saveptr)
-{
-    char *file, *rfile;
-    SF(file, strtok_r, NULL, (NULL, "\n", saveptr));
-
-    SF(rfile, malloc, NULL, (strlen(file) + 7));
-    sprintf(rfile, "/host/%s", file);
-
-    if (childE != 2) close(childE);
-    SF(childE, open, -1, (rfile, O_WRONLY|O_CREAT, 0666));
-    free(rfile);
-}
-
-void handleSetID(int u, char **saveptr)
-{
-    char *ids;
-    uid_t id;
-    SF(ids, strtok_r, NULL, (NULL, "\n", saveptr));
-    id = atoi(ids);
-
-    if (u) {
-        childUID = id;
-    } else {
-        childGID = (gid_t) id;
-    }
-}
-
-void handleTTYRaw(char **saveptr)
-{
-    struct termios termios_p;
-    int tmpi;
-
-    /* input ... */
-    SF(tmpi, tcgetattr, -1, (childI, &termios_p));
-    cfmakeraw(&termios_p);
-    SF(tmpi, tcsetattr, -1, (childI, TCSANOW, &termios_p));
-
-    /* output ... */
-    SF(tmpi, tcgetattr, -1, (childO, &termios_p));
-    cfmakeraw(&termios_p);
-    SF(tmpi, tcsetattr, -1, (childO, TCSANOW, &termios_p));
-}
-
-void handleEnv(char **saveptr)
-{
-    char *var, *val;
-
-    SF(var, strtok_r, NULL, (NULL, " ", saveptr));
-    SF(val, strtok_r, NULL, (NULL, "\n", saveptr));
-    setenv(var, val, 1);
-}
-
-void crash()
-{
-    fprintf(stderr, "\n----------\nUMLBox is crashing!\n----------\n\n");
-    exit(1);
+  for (size_t i = 0; i < cfg->n_run; i++)
+    printf("- run: %s\n", cfg->run[i]->cmd);
 }
