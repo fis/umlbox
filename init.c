@@ -25,8 +25,10 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -45,6 +47,7 @@ static void open_to(int new_fd, const char *path, int flags, int fallback_fd);
 static ssize_t readall(int fd, void *buf, size_t count);
 static void mkdirs(const char *dir);
 static void hostify(const char *cwd, bool user, uid_t uid, gid_t gid);
+static void set_limits(size_t n_limit, Limit **limit);
 static void dump_config(uint32_t len, const Config *cfg);
 
 static int in_init = 1; // used to modify behavior of fail for children
@@ -86,9 +89,10 @@ int main()
   MUST("mkdir /host", -1, mkdir, "/host", 0777u);
 
   {
-    struct sigaction act = {0};
-    act.sa_sigaction = handle_timeout;
-    act.sa_flags = SA_SIGINFO;
+    struct sigaction act = {
+      .sa_sigaction = handle_timeout,
+      .sa_flags = SA_SIGINFO,
+    };
     MUST("sigaction", -1, sigaction, SIGRTMIN, &act, NULL);
   }
 
@@ -210,6 +214,7 @@ static void handle_run(const Run *run) {
       setenv(run->env[i]->key, run->env[i]->value, /* overwrite= */ 1);
 
     hostify(run->cwd, run->user, uid, gid);
+    set_limits(run->n_limit, run->limit);
 
     char **argv = MUST("malloc argv", (void *) 0, malloc, (run->n_arg + 2) * sizeof *argv);
     argv[0] = run->cmd;
@@ -237,7 +242,7 @@ static void handle_run(const Run *run) {
     ev.sigev_signo = SIGRTMIN;
     ev.sigev_value.sival_ptr = (void *) &timeout_phase;
     MUST("timer_create", -1, timer_create, CLOCK_MONOTONIC, &ev, &timeout_timer);
-    struct itimerspec timeout = {{0, 0}, {run->timeout, 0}};
+    struct itimerspec timeout = { .it_value = { .tv_sec = run->timeout } };
     MUST("timer_settime (TERM)", -1, timer_settime, timeout_timer, 0, &timeout, 0);
   }
 
@@ -249,7 +254,7 @@ static void handle_run(const Run *run) {
         if (child_running) MUST("kill (TERM)", -1, kill, child, SIGTERM);
         if (cat_running) MUST("kill (cat, TERM)", -1, kill, cat, SIGTERM);
         timeout_phase = 2;
-        struct itimerspec grace = {{0, 0}, {5, 0}};
+        struct itimerspec grace = { .it_value = { .tv_sec = 5 } };
         MUST("timer_settime (KILL)", -1, timer_settime, timeout_timer, 0, &grace, 0);
       } else if (timeout_phase == 3) {
         if (child_running) MUST("kill (KILL)", -1, kill, child, SIGKILL);
@@ -342,6 +347,34 @@ static void hostify(const char *cwd, bool user, uid_t uid, gid_t gid) {
   if (user) {
     MUST("setgid", -1, setgid, gid);
     MUST("setuid", -1, setuid, uid);
+  }
+}
+
+static void set_limits(size_t n_limit, Limit **limit) {
+  static const struct {
+    bool valid;
+    int resource;
+  } resource_map[] = {
+    [LIMIT__RESOURCE__AS] = { true, RLIMIT_AS },
+    [LIMIT__RESOURCE__CORE] = { true, RLIMIT_CORE },
+    [LIMIT__RESOURCE__CPU] = { true, RLIMIT_CPU },
+    [LIMIT__RESOURCE__DATA] = { true, RLIMIT_DATA },
+    [LIMIT__RESOURCE__FSIZE] = { true, RLIMIT_FSIZE },
+    [LIMIT__RESOURCE__MEMLOCK] = { true, RLIMIT_MEMLOCK },
+    [LIMIT__RESOURCE__NOFILE] = { true, RLIMIT_NOFILE },
+    [LIMIT__RESOURCE__NPROC] = { true, RLIMIT_NPROC },
+    [LIMIT__RESOURCE__STACK] = { true, RLIMIT_STACK },
+  };
+  static const int n_resource_map = sizeof resource_map / sizeof *resource_map;
+
+  struct rlimit rlim;
+  for (size_t i = 0; i < n_limit; i++) {
+    Limit *l = limit[i];
+    if (l->resource < 0 || l->resource >= n_resource_map || !resource_map[l->resource].valid)
+      errno = EINVAL, fail("set_limits");
+    rlim.rlim_cur = l->soft >= 0 ? l->soft : RLIM_INFINITY;
+    rlim.rlim_max = l->hard >= 0 ? l->hard : RLIM_INFINITY;
+    MUST("setrlimit", -1, setrlimit, resource_map[l->resource].resource, &rlim);
   }
 }
 

@@ -81,6 +81,9 @@ def parse_args():
     group.add_argument(
         '--memory', metavar='M', default='256M',
         help='set a memory limit of M (default 256M)')
+    group.add_argument(
+        '--limit', nargs=2, metavar=('RES', 'LIMIT'), action='append', default=[],
+        help='set a resource limit (as in setrlimit(2))')
 
     group = parser.add_argument_group('paths')
     group.add_argument(
@@ -192,6 +195,10 @@ def main():
         if len(parts) != 2:
             parser.error('expected --env VAR=VALUE, got --env "{}"'.format(spec))
         cmd.env.add(key=parts[0], value=parts[1])
+    for res_spec, limit_spec in args.limit:
+        res = config_pb2.Limit.Resource.Value(res_spec)
+        limit = int(limit_spec, 0)
+        cmd.limit.add(resource=res, soft=limit, hard=limit)
 
     if args.verbose:
         print('Configuration:\n{}'.format(cfg))

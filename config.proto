@@ -57,9 +57,30 @@ message Run {
   int32 gid = 12;
   // if non-zero, send SIGTERM to the process after this many seconds, and SIGKILL soon after
   int32 timeout = 13;
+  // list of resource limits to set on the child process
+  repeated Limit limit = 14;
 }
 
 message EnvVar {
   string key = 1;
   string value = 2;
+}
+
+// resource limit; use a negative value to denote RLIM_INFINITY
+message Limit {
+  enum Resource {
+    UNKNOWN = 0;
+    AS = 1;
+    CORE = 2;
+    CPU = 3;
+    DATA = 4;
+    FSIZE = 5;
+    MEMLOCK = 6;
+    NOFILE = 7;
+    NPROC = 8;
+    STACK = 9;
+  }
+  Resource resource = 1;
+  int64 soft = 2;
+  int64 hard = 3;
 }
