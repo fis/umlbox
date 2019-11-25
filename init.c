@@ -231,7 +231,6 @@ static void handle_run(const Run *run) {
     if (strchr(cmd, '/') == 0) {
       path = getenv("PATH");
       if (!path) path = DEFAULT_PATH;
-      MUST("strdup (path)", (char *) 0, strdup, path);
       cmd = MUST("malloc (cmd)", (void *) 0, malloc, strlen(path) + strlen(run->cmd) + 2);
     }
     do {
