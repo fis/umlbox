@@ -37,6 +37,9 @@
 
 #include "config.pb-c.h"
 
+#define DEFAULT_PATH "/usr/local/bin:/bin:/usr/bin"
+#define DEFAULT_SHELL "/bin/bash"
+
 static void handle_tty_raw(const char *dev);
 static void handle_mount(const Mount *mnt);
 static void handle_run(const Run *run);
@@ -82,7 +85,7 @@ int main()
 
   if (clearenv() != 0)
     fail("clearenv");
-  setenv("PATH", "/usr/local/bin:/bin:/usr/bin", 1);
+  setenv("PATH", DEFAULT_PATH, 1);
   setenv("TERM", "linux", 1);
   setenv("HOME", "/tmp", 1);
 
@@ -216,14 +219,41 @@ static void handle_run(const Run *run) {
     hostify(run->cwd, run->user, uid, gid);
     set_limits(run->n_limit, run->limit);
 
-    char **argv = MUST("malloc argv", (void *) 0, malloc, (run->n_arg + 2) * sizeof *argv);
-    argv[0] = run->cmd;
+    char **argv = MUST("malloc argv", (void *) 0, malloc, (run->n_arg + 3) * sizeof *argv);
+    argv[0] = DEFAULT_SHELL;
+    argv[1] = run->cmd;
     for (size_t i = 0; i < run->n_arg; i++)
-      argv[1 + i] = run->arg[i];
-    argv[1 + run->n_arg] = 0;
+      argv[2 + i] = run->arg[i];
+    argv[2 + run->n_arg] = 0;
 
-    MUST("execvp", -1, execvp, argv[0], argv);
-    exit(0);
+    char *cmd = run->cmd;
+    char *path = 0;
+    if (strchr(cmd, '/') == 0) {
+      path = getenv("PATH");
+      if (!path) path = DEFAULT_PATH;
+      MUST("strdup (path)", (char *) 0, strdup, path);
+      cmd = MUST("malloc (cmd)", (void *) 0, malloc, strlen(path) + strlen(run->cmd) + 2);
+    }
+    do {
+      if (path) {
+        char *colon = strchr(path, ':');
+        if (colon) {
+          sprintf(cmd, "%.*s/%s", (int) (colon - path), path, run->cmd);
+          path = colon + 1;
+        } else {
+          sprintf(cmd, "%s/%s", path, run->cmd);
+          path += strlen(path);
+        }
+      }
+      execv(cmd, argv + 1);
+      if (errno == ENOEXEC) {
+        argv[1] = cmd;
+        execv(DEFAULT_SHELL, argv);
+        break;
+      }
+    } while (path && *path);
+    printf("%s?\n", run->cmd);
+    exit(1);
   }
 
   if (run->daemon)
