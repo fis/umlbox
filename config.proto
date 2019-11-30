@@ -8,6 +8,8 @@ message Config {
   repeated Mount mount = 2;
   // sequence of commands to execute
   repeated Run run = 3;
+  // random bytes to initialize the entropy pool with
+  bytes random = 4;
 }
 
 // mount configuration

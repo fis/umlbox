@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/random.h>
 #include <linux/reboot.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -40,6 +41,7 @@
 #define DEFAULT_PATH "/usr/local/bin:/bin:/usr/bin"
 #define DEFAULT_SHELL "/bin/bash"
 
+static void handle_random(size_t len, uint8_t *data);
 static void handle_tty_raw(const char *dev);
 static void handle_mount(const Mount *mnt);
 static void handle_run(const Run *run);
@@ -124,6 +126,9 @@ int main()
 
   // execute all the actions
 
+  if (cfg->random.len > 0)
+    handle_random(cfg->random.len, cfg->random.data);
+
   for (size_t i = 0; i < cfg->n_tty_raw; i++)
     handle_tty_raw(cfg->tty_raw[i]);
 
@@ -136,6 +141,20 @@ int main()
   sync();
   reboot(LINUX_REBOOT_CMD_POWER_OFF);
   return 0;
+}
+
+static void handle_random(size_t len, uint8_t *data) {
+  MUST("mknod /random", -1, mknod, "/random", 0644 | S_IFCHR, makedev(1, 8));
+  int fd = MUST("open /random", -1, open, "/random", O_RDONLY);
+
+  struct rand_pool_info *info = MUST("malloc rand_pool_info", (void *) 0, malloc, sizeof *info + len);
+  info->entropy_count = 8 * len;
+  info->buf_size = len;
+  memcpy(info->buf, data, len);
+  MUST("ioctl /random", -1, ioctl, fd, RNDADDENTROPY, info);
+  free(info);
+
+  MUST("close /random", -1, close, fd);
 }
 
 static void handle_tty_raw(const char *dev) {

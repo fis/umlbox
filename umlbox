@@ -16,6 +16,7 @@
 import argparse
 import collections
 import os
+import secrets
 import struct
 import subprocess
 import sys
@@ -62,6 +63,9 @@ def parse_args():
     group.add_argument(
         '--root', action='store_true',
         help='run as root within UML (negates security benefits)')
+    group.add_argument(
+        '--random', metavar='N', type=int, default=0,
+        help='push N bytes of randomness from the host to the guest')
 
     group = parser.add_argument_group('communication options')
     group.add_argument(
@@ -199,6 +203,9 @@ def main():
         res = config_pb2.Limit.Resource.Value(res_spec)
         limit = int(limit_spec, 0)
         cmd.limit.add(resource=res, soft=limit, hard=limit)
+
+    if args.random > 0:
+        cfg.random = secrets.token_bytes(args.random)
 
     if args.verbose:
         print('Configuration:\n{}'.format(cfg))
