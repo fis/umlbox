@@ -233,6 +233,7 @@ static void handle_run(const Run *run) {
       if (!path) path = DEFAULT_PATH;
       cmd = MUST("malloc (cmd)", (void *) 0, malloc, strlen(path) + strlen(run->cmd) + 2);
     }
+    int exec_errno = 0;
     do {
       if (path) {
         char *colon = strchr(path, ':');
@@ -248,10 +249,12 @@ static void handle_run(const Run *run) {
       if (errno == ENOEXEC) {
         argv[1] = cmd;
         execv(DEFAULT_SHELL, argv);
+        if (exec_errno != EACCES) exec_errno = errno;
         break;
       }
+      if (exec_errno != EACCES) exec_errno = errno;
     } while (path && *path);
-    printf("%s?\n", run->cmd);
+    printf("%s? %s\n", run->cmd, strerror(exec_errno));
     exit(1);
   }
 
