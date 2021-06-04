@@ -14,10 +14,12 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/random.h>
 #include <linux/reboot.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -44,8 +46,8 @@
 static void handle_random(size_t len, uint8_t *data);
 static void handle_tty_raw(const char *dev);
 static void handle_mount(const Mount *mnt);
-static void handle_run(const Run *run);
-static void handle_timeout(int sig, siginfo_t *info, void *ctx);
+static bool handle_run(const Run *run);
+static void handle_sigchld(int sig, siginfo_t *info, void *ctx);
 
 static void fail(const char *msg);
 static void open_to(int new_fd, const char *path, int flags, int fallback_fd);
@@ -95,10 +97,10 @@ int main()
 
   {
     struct sigaction act = {
-      .sa_sigaction = handle_timeout,
+      .sa_sigaction = handle_sigchld,
       .sa_flags = SA_SIGINFO,
     };
-    MUST("sigaction", -1, sigaction, SIGRTMIN, &act, NULL);
+    MUST("sigaction", -1, sigaction, SIGCHLD, &act, NULL);
   }
 
   // parse the configuration
@@ -135,8 +137,11 @@ int main()
   for (size_t i = 0; i < cfg->n_mount; i++)
     handle_mount(cfg->mount[i]);
 
-  for (size_t i = 0; i < cfg->n_run; i++)
-    handle_run(cfg->run[i]);
+  for (size_t i = 0; i < cfg->n_run; i++) {
+    bool timed_out = handle_run(cfg->run[i]);
+    if (timed_out)
+      break;
+  }
 
   sync();
   reboot(LINUX_REBOOT_CMD_POWER_OFF);
@@ -184,8 +189,13 @@ static void handle_mount(const Mount *mnt) {
   MUST("mount", -1, mount, mnt->source, target, mnt->fstype, flags, *mnt->data ? mnt->data : NULL);
 }
 
-static void handle_run(const Run *run) {
+static bool handle_run(const Run *run) {
   printf("umlbox run: %s\n", run->cmd);
+
+  sigset_t orig_mask, chld_mask;
+  sigemptyset(&chld_mask);
+  sigaddset(&chld_mask, SIGCHLD);
+  MUST("sigprocmask (block SIGCHLD)", -1, sigprocmask, SIG_BLOCK, &chld_mask, &orig_mask);
 
   uid_t uid = run->uid;
   gid_t gid = run->gid;
@@ -277,55 +287,54 @@ static void handle_run(const Run *run) {
     exit(1);
   }
 
-  if (run->daemon)
-    return;
+  if (run->daemon) {
+    MUST("sigprocmask (unblock SIGCHLD)", -1, sigprocmask, SIG_SETMASK, &orig_mask, 0);
+    return false;
+  }
 
   if (cat != -1) {
     close(cat_pipe[0]);
     close(cat_pipe[1]);
   }
 
-  timer_t timeout_timer;
-  volatile int timeout_phase = 0;
-  if (run->timeout > 0) {
-    struct sigevent ev = {0};
-    ev.sigev_notify = SIGEV_SIGNAL;
-    ev.sigev_signo = SIGRTMIN;
-    ev.sigev_value.sival_ptr = (void *) &timeout_phase;
-    MUST("timer_create", -1, timer_create, CLOCK_MONOTONIC, &ev, &timeout_timer);
-    struct itimerspec timeout = { .it_value = { .tv_sec = run->timeout } };
-    MUST("timer_settime (TERM)", -1, timer_settime, timeout_timer, 0, &timeout, 0);
-  }
+  bool timed_out = false;
+  struct pollfd timeout_fd = { .fd = 0, .events = POLLIN };
 
   bool child_running = 1, cat_running = run->cat_output;
-  while (child_running || cat_running) {
-    pid_t waited = wait(0);
-    if (waited == -1 && errno == EINTR) {
-      if (timeout_phase == 1) {
-        if (child_running) MUST("kill (TERM)", -1, kill, child, SIGTERM);
-        timeout_phase = 2;
-        struct itimerspec grace = { .it_value = { .tv_sec = 5 } };
-        MUST("timer_settime (KILL)", -1, timer_settime, timeout_timer, 0, &grace, 0);
-      } else if (timeout_phase == 3) {
-        if (child_running) MUST("kill (KILL)", -1, kill, child, SIGKILL);
-        if (cat_running) MUST("kill (cat, KILL)", -1, kill, cat, SIGKILL);
-      }
-      continue;
-    }
+  while (true) {
+    pid_t waited = waitpid(-1, 0, WNOHANG);
     if (waited == -1)
       fail("wait");
+    if (waited != 0) {
+      if (waited == child) child_running = false;
+      if (waited == cat) cat_running = false;
+      if (!child_running && !cat_running)
+        break;
+      continue;
+    }
 
-    if (waited == child) child_running = false;
-    if (waited == cat) cat_running = false;
+    int ret = ppoll(&timeout_fd, 1, 0, &orig_mask);
+    if (ret == -1 && errno == EINTR) {
+      continue;
+    }
+    if (ret == -1)
+      fail("poll (timeout signal)");
+
+    unsigned char hard_timeout;
+    MUST("read (timeout signal)", -1, read, 0, &hard_timeout, 1);
+    timed_out = true;
+    if (hard_timeout)
+      break;
+    if (child_running)
+      MUST("kill", -1, kill, child, SIGTERM);
   }
-  if (run->timeout > 0)
-    timer_delete(timeout_timer);
+
+  MUST("sigprocmask (unblock SIGCHLD)", -1, sigprocmask, SIG_SETMASK, &orig_mask, 0);
+  return timed_out;
 }
 
-static void handle_timeout(int sig, siginfo_t *info, void *ctx) {
-  volatile int *phase = (volatile int*) info->si_ptr;
-  ++*phase;
-  // wait already interrupted by this signal
+static void handle_sigchld(int sig, siginfo_t *info, void *ctx) {
+  // poll already interrupted by this signal, no action needed
 }
 
 // utilities

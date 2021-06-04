@@ -57,10 +57,8 @@ message Run {
   int32 uid = 11;
   // use this specific GID for the program
   int32 gid = 12;
-  // if non-zero, send SIGTERM to the process after this many seconds, and SIGKILL soon after
-  int32 timeout = 13;
   // list of resource limits to set on the child process
-  repeated Limit limit = 14;
+  repeated Limit limit = 13;
 }
 
 message EnvVar {

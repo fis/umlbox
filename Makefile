@@ -10,7 +10,7 @@ PREFIX=/usr
 
 all: nokernel umlbox-linux
 
-nokernel: umlbox-initrd.gz umlbox-mudem
+nokernel: umlbox-initrd.gz umlbox-mudem config_pb2.py
 
 umlbox-initrd.gz: init
 	echo init | cpio -H newc -o | gzip -9c > umlbox-initrd.gz
