@@ -261,19 +261,19 @@ def main():
             except subprocess.TimeoutExpired:
                 pass
             if uml.returncode is None:
-                os.write(ctrl_w, b'\x00')
+                os.write(ctrl_w, b'N\n')  # soft timeout
                 try:
                     uml.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
             if uml.returncode is None:
-                os.write(ctrl_w, b'\x01')
+                os.write(ctrl_w, b'Y\n')  # hard timeout
                 try:
                     uml.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
             if uml.returncode is None:
-                os.killpg(uml.pid, signal.SIGKILL)
+                os.killpg(uml.pid, signal.SIGKILL)  # hardest timeout
                 uml.wait()
 
     os.close(cmd_fd)

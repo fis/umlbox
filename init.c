@@ -320,10 +320,10 @@ static bool handle_run(const Run *run) {
     if (ret == -1)
       fail("poll (timeout signal)");
 
-    unsigned char hard_timeout;
-    MUST("read (timeout signal)", -1, read, 0, &hard_timeout, 1);
+    unsigned char hard_timeout[2];
+    MUST("read (timeout signal)", -1, read, 0, hard_timeout, 2);
     timed_out = true;
-    if (hard_timeout)
+    if (*hard_timeout == 'Y')
       break;
     if (child_running)
       MUST("kill", -1, kill, child, SIGTERM);
